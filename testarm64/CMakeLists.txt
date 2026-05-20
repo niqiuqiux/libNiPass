@@ -37,6 +37,8 @@ project(NiPassTestARM64)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_CXX_STANDARD 23)
+set(NIPASS_TEST_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../tests/sources"
+    CACHE PATH "Shared NiPass test source directory")
 
 # ============================================================================
 # NiPass 插件配置
@@ -74,16 +76,16 @@ function(add_nipass_test target source)
 endfunction()
 
 # 基础测试 - 覆盖各类混淆场景
-add_nipass_test(test_nipass test.c)
+add_nipass_test(test_nipass "${NIPASS_TEST_SOURCE_DIR}/test.c")
 
 # 注解驱动测试 - 覆盖函数级注解与子选项
-add_nipass_test(test_annotate test_annotate.c)
+add_nipass_test(test_annotate "${NIPASS_TEST_SOURCE_DIR}/test_annotate.c")
 
 # 生产级测试 - 模拟真实 native 库场景
-add_nipass_test(test_production test_production.c)
+add_nipass_test(test_production "${NIPASS_TEST_SOURCE_DIR}/test_production.c")
 
 # STL 测试 - 容器/算法/智能指针/variant
-add_nipass_test(test_stl test_stl.cpp)
+add_nipass_test(test_stl "${NIPASS_TEST_SOURCE_DIR}/test_stl.cpp")
 
 # 模板元编程测试 - CRTP/SFINAE/表达式模板/策略模式
-add_nipass_test(test_template test_template.cpp)
+add_nipass_test(test_template "${NIPASS_TEST_SOURCE_DIR}/test_template.cpp")

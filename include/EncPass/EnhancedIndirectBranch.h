@@ -31,6 +31,17 @@ struct BBEncInfo {
   uint32_t variant;  // 解密模板选择器 (0/1/2)
 };
 
+// 每函数全局表索引编码。编译期:
+//   encoded = ((real + addKey) * mulKey) ^ xorKey
+// 运行时:
+//   real = ((encoded ^ xorKey) * invMulKey) - addKey
+struct BranchIndexCodec {
+  uint64_t xorKey;
+  uint64_t addKey;
+  uint64_t mulKey;
+  uint64_t invMulKey;
+};
+
 class EnhancedIndirectBranchPass
     : public PassInfoMixin<EnhancedIndirectBranchPass> {
 public:
@@ -43,8 +54,8 @@ public:
   std::unordered_map<BasicBlock *, unsigned> indexmap;
   // BB → 加密信息
   std::map<BasicBlock *, BBEncInfo> BBKeys;
-  // 函数 → 索引混淆密钥
-  std::map<Function *, uint64_t> funcIndexKeys;
+  // 函数 → 索引混淆参数
+  std::map<Function *, BranchIndexCodec> funcIndexCodecs;
   // 需要混淆的函数集合
   std::unordered_set<Function *> to_obf_funcs;
 

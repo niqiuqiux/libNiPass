@@ -6,8 +6,8 @@
 #include "EncPass/EnhancedStringEncryption.h"
 #include "EncPass/EnVMFlatten.h"
 #include "EncPass/EnhancedIndirectCall.h"
-#include "EncPass/EnhancedIndirectGlobalVariable.h"
 #include "EncPass/EnhancedIndirectBranch.h"
+#include "Utils.h"
 
 using namespace llvm;
 
@@ -16,10 +16,20 @@ static cl::opt<bool> s_obf_enstr("enstrenc", cl::init(false), cl::desc("Enhanced
 static cl::opt<bool> s_obf_enfla("enfla", cl::init(false), cl::desc("FlatteningEnhanced"));
 static cl::opt<bool> s_obf_envmf("envmf", cl::init(false), cl::desc("Enhanced VMFlatten: polymorphic dispatcher, dummy instructions, operand encoding, bytecode XOR encryption"));
 static cl::opt<bool> s_obf_eicall("eicall", cl::init(false), cl::desc("Enhanced Indirect Call: per-entry keys, multi-layer XOR+ADD, index obfuscation, polymorphic decrypt"));
-static cl::opt<bool> s_obf_eigv("eigv", cl::init(false), cl::desc("Enhanced Indirect Global Variable: per-entry keys, multi-layer XOR+ADD, index obfuscation, polymorphic decrypt"));
 static cl::opt<bool> s_obf_eibr("eibr", cl::init(false), cl::desc("Enhanced Indirect Branch: per-entry keys, multi-layer XOR+ADD, index obfuscation, polymorphic decrypt, stack mode, BB shuffle"));
 
 namespace ni_pass {
+
+class AnnotationMetadataPass : public PassInfoMixin<AnnotationMetadataPass> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    annotation2Metadata(M);
+    stripObfuscationAnnotations(M);
+    return PreservedAnalyses::none();
+  }
+
+  static bool isRequired() { return true; }
+};
 
 void PassRegistry::registerPassBuilderCallbacks(llvm::PassBuilder &PB) {
   outs() << "Made By Ni-QiuQiu\n";
@@ -37,14 +47,13 @@ void PassRegistry::registerModulePasses(llvm::PassBuilder &PB) {
     #endif
       {
         {
+          MPM.addPass(AnnotationMetadataPass());
+
           // 模块级 Pass
           MPM.addPass(EnhancedStringEncryptionPass(s_obf_enstr));
 
           // 函数级 Pass
           registerFunctionPasses(MPM);
-
-          // 模块级 Pass（需要在函数级之后）
-          MPM.addPass(EnhancedIndirectGlobalVariablePass(s_obf_eigv));
 
           return true;
         }
@@ -82,17 +91,6 @@ void PassRegistry::registerPipelineParsingCallbacks(llvm::PassBuilder &PB) {
          ArrayRef<PassBuilder::PipelineElement>) {
         if (Name == "eicall") {
           FPM.addPass(EnhancedIndirectCallPass(true));
-          return true;
-        }
-        return false;
-      });
-
-  // 注册EnhancedIndirectGlobalVariable Pass
-  PB.registerPipelineParsingCallback(
-      [](StringRef Name, ModulePassManager &MPM,
-         ArrayRef<PassBuilder::PipelineElement>) {
-        if (Name == "eigv") {
-          MPM.addPass(EnhancedIndirectGlobalVariablePass(true));
           return true;
         }
         return false;

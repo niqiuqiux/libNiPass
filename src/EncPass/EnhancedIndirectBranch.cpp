@@ -28,6 +28,135 @@ static cl::opt<bool>
 
 namespace ni_pass {
 
+static uint64_t modularInverseOdd(uint64_t value, unsigned bits) {
+  uint64_t inv = 1;
+  for (unsigned i = 0; i < bits; ++i)
+    inv *= 2 - value * inv;
+  if (bits < 64)
+    inv &= ((1ULL << bits) - 1);
+  return inv;
+}
+
+static BranchIndexCodec makeBranchIndexCodec(unsigned bits) {
+  BranchIndexCodec C;
+  C.xorKey = cryptoutils->get_uint64_t();
+  C.addKey = cryptoutils->get_uint64_t();
+  C.mulKey = cryptoutils->get_uint64_t() | 1;
+  C.invMulKey = modularInverseOdd(C.mulKey, bits);
+  return C;
+}
+
+static uint64_t encodeBranchIndex(uint64_t realIdx,
+                                  const BranchIndexCodec &Codec,
+                                  unsigned bits) {
+  uint64_t mask = bits >= 64 ? ~0ULL : ((1ULL << bits) - 1);
+  uint64_t encoded = ((realIdx + Codec.addKey) * Codec.mulKey) & mask;
+  encoded ^= Codec.xorKey;
+  return encoded & mask;
+}
+
+static Value *emitDecodeBranchIndex(IRBuilder<NoFolder> &IRB,
+                                    uint64_t encodedIdx,
+                                    const BranchIndexCodec &Codec,
+                                    IntegerType *intType) {
+  Value *V = ConstantInt::get(intType, encodedIdx);
+  V = IRB.CreateXor(V, emitSplitKey(IRB, Codec.xorKey, intType));
+  V = IRB.CreateMul(V, emitSplitKey(IRB, Codec.invMulKey, intType));
+  V = IRB.CreateSub(V, emitSplitKey(IRB, Codec.addKey, intType));
+  return V;
+}
+
+static void redirectPHIIncomingBlock(BasicBlock *Target,
+                                     BasicBlock *OldPred,
+                                     BasicBlock *NewPred) {
+  for (Instruction &I : *Target) {
+    PHINode *PN = dyn_cast<PHINode>(&I);
+    if (!PN)
+      break;
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+      if (PN->getIncomingBlock(i) == OldPred)
+        PN->setIncomingBlock(i, NewPred);
+  }
+}
+
+static Value *emitEncryptedBlockAddress(IRBuilder<NoFolder> &IRB,
+                                        BasicBlock *BB,
+                                        const BBEncInfo &Info,
+                                        IntegerType *intType,
+                                        LLVMContext &Ctx) {
+  auto *Int8PtrTy = Type::getInt8Ty(Ctx)->getPointerTo();
+  uint64_t CombinedKey = (Info.key1 ^ Info.key2) + (Info.key3 ^ Info.key4);
+  Value *BA = BlockAddress::get(BB->getParent(), BB);
+  Value *AsPtr = IRB.CreateBitCast(BA, Int8PtrTy);
+  Value *AsInt = IRB.CreatePtrToInt(AsPtr, intType);
+  Value *EncInt =
+      IRB.CreateAdd(AsInt, emitSplitKey(IRB, CombinedKey, intType));
+  return IRB.CreateIntToPtr(EncInt, Int8PtrTy);
+}
+
+static void insertLazyGlobalBranchTableInitializer(
+    Function &F, GlobalVariable *GlobalTable,
+    const std::unordered_map<BasicBlock *, unsigned> &IndexMap,
+    const std::map<BasicBlock *, BBEncInfo> &BBKeys, IntegerType *intType) {
+  if (!GlobalTable)
+    return;
+
+  SmallVector<BasicBlock *, 16> Blocks;
+  for (BasicBlock &BB : F) {
+#if LLVM_VERSION_MAJOR <= 12
+    if (&BB == &F.getEntryBlock())
+      continue;
+#else
+    if (BB.isEntryBlock())
+      continue;
+#endif
+    if (IndexMap.find(&BB) != IndexMap.end() && BBKeys.find(&BB) != BBKeys.end())
+      Blocks.push_back(&BB);
+  }
+  if (Blocks.empty())
+    return;
+
+  Module *M = F.getParent();
+  LLVMContext &Ctx = F.getContext();
+  auto *i8Ty = Type::getInt8Ty(Ctx);
+  ConstantInt *Zero = ConstantInt::get(intType, 0);
+
+  GlobalVariable *InitState = new GlobalVariable(
+      *M, i8Ty, false, GlobalValue::PrivateLinkage,
+      ConstantInt::get(i8Ty, 0), createObfuscatedName(*M));
+  writeObfuscationMetadata(InitState, "nipass.generated");
+
+  BasicBlock &Entry = F.getEntryBlock();
+  Instruction *SplitPt = &*Entry.getFirstInsertionPt();
+  BasicBlock *ContBB = Entry.splitBasicBlock(SplitPt->getIterator(), "");
+  BasicBlock *InitBB = BasicBlock::Create(Ctx, "", &F, ContBB);
+
+  Entry.getTerminator()->eraseFromParent();
+  IRBuilder<NoFolder> EntryIRB(&Entry);
+  LoadInst *State = EntryIRB.CreateLoad(i8Ty, InitState);
+  State->setAtomic(AtomicOrdering::Acquire);
+  State->setAlignment(Align(1));
+  Value *NeedInit =
+      EntryIRB.CreateICmpEQ(State, ConstantInt::get(i8Ty, 0));
+  EntryIRB.CreateCondBr(NeedInit, InitBB, ContBB);
+
+  IRBuilder<NoFolder> InitIRB(InitBB);
+  for (BasicBlock *BB : Blocks) {
+    Value *Idx = ConstantInt::get(intType, IndexMap.at(BB));
+    Value *GEP =
+        InitIRB.CreateGEP(GlobalTable->getValueType(), GlobalTable, {Zero, Idx});
+    Value *EncPtr =
+        emitEncryptedBlockAddress(InitIRB, BB, BBKeys.at(BB), intType, Ctx);
+    InitIRB.CreateStore(EncPtr, GEP);
+  }
+
+  StoreInst *Ready =
+      InitIRB.CreateStore(ConstantInt::get(i8Ty, 1), InitState);
+  Ready->setAtomic(AtomicOrdering::Release);
+  Ready->setAlignment(Align(1));
+  InitIRB.CreateBr(ContBB);
+}
+
 // === 模块初始化：收集 BB、创建全局加密表 ===
 
 bool EnhancedIndirectBranchPass::initialize(Module &M) {
@@ -85,7 +214,7 @@ bool EnhancedIndirectBranchPass::initialize(Module &M) {
   }
 
   // 创建全局表（编译时直接用 ConstantExpr 计算加密值）
-  std::string GVName = ".eibr_" + std::to_string(cryptoutils->get_uint32_t());
+  std::string GVName = createObfuscatedName(M);
   std::vector<Constant *> Elements;
   for (BasicBlock *BB : AllBBs) {
     // 为每个 BB 生成 4 个独立密钥
@@ -97,15 +226,9 @@ bool EnhancedIndirectBranchPass::initialize(Module &M) {
     Info.variant = cryptoutils->get_range(0, 3);
     BBKeys[BB] = Info;
 
-    // 编译时加密: combined = (key1 ^ key2) + (key3 ^ key4)
-    //            stored = inttoptr( ptrtoint(ptr) + combined )
-    Constant *BA = BlockAddress::get(BB->getParent(), BB);
-    Constant *CE = ConstantExpr::getBitCast(BA, i8ptr);
-    Constant *AsInt = ConstantExpr::getPtrToInt(CE, intType);
-    uint64_t combinedKey = (Info.key1 ^ Info.key2) + (Info.key3 ^ Info.key4);
-    Constant *Added = ConstantExpr::getAdd(AsInt, ConstantInt::get(intType, combinedKey));
-    Constant *Encrypted = ConstantExpr::getIntToPtr(Added, i8ptr);
-    Elements.push_back(Encrypted);
+    Constant *Garbage = ConstantExpr::getIntToPtr(
+        ConstantInt::get(intType, cryptoutils->get_uint64_t()), i8ptr);
+    Elements.push_back(Garbage);
   }
 
   ArrayType *ATy = ArrayType::get(i8ptr, Elements.size());
@@ -113,11 +236,13 @@ bool EnhancedIndirectBranchPass::initialize(Module &M) {
   GlobalTable = new GlobalVariable(M, ATy, false,
                                    GlobalValue::LinkageTypes::PrivateLinkage,
                                    CA, GVName);
+  writeObfuscationMetadata(GlobalTable, "nipass.generated");
   appendToCompilerUsed(M, {GlobalTable});
 
-  // 为每个函数生成独立 indexKey
+  // 为每个函数生成独立索引编码参数
+  unsigned indexBits = intType->getBitWidth();
   for (Function *F : to_obf_funcs)
-    funcIndexKeys[F] = cryptoutils->get_uint64_t();
+    funcIndexCodecs[F] = makeBranchIndexCodec(indexBits);
 
   this->initialized = true;
   return true;
@@ -133,6 +258,8 @@ PreservedAnalyses EnhancedIndirectBranchPass::run(Function &F,
     initialize(*M);
 
   if (to_obf_funcs.find(&F) == to_obf_funcs.end())
+    return PreservedAnalyses::all();
+  if (readObfuscationMetadata(&F, "envmf.applied"))
     return PreservedAnalyses::all();
 
   LLVM_DEBUG(dbgs() << "\033[1;36m[EnhancedIndirectBranch] Function : " << F.getName()
@@ -152,13 +279,16 @@ PreservedAnalyses EnhancedIndirectBranchPass::run(Function &F,
   bool useStack = EIBRUseStack;
   toObfuscateBoolOption(&F, "eibr_use_stack", &useStack);
 
-  uint64_t indexKey = funcIndexKeys[&F];
+  const BranchIndexCodec &indexCodec = funcIndexCodecs[&F];
 
   // 收集所有分支指令
   SmallVector<BranchInst *, 32> BIs;
   for (Instruction &Inst : instructions(F))
     if (BranchInst *BI = dyn_cast<BranchInst>(&Inst))
       BIs.emplace_back(BI);
+
+  insertLazyGlobalBranchTableInitializer(F, GlobalTable, indexmap, BBKeys,
+                                         intType);
 
   IRBuilder<NoFolder> IRBEntry(&F.getEntryBlock().front());
 
@@ -185,6 +315,8 @@ PreservedAnalyses EnhancedIndirectBranchPass::run(Function &F,
 
     if (BBs.empty())
       continue;
+    if (BI->isConditional() && BBs.size() != 2)
+      continue;
 
     GlobalVariable *LoadFrom = nullptr;
 
@@ -193,7 +325,13 @@ PreservedAnalyses EnhancedIndirectBranchPass::run(Function &F,
       // === 条件分支 / 目标不在全局表 → 创建局部加密表 ===
       std::vector<Constant *> LocalElements;
       std::vector<BBEncInfo> LocalKeys;
-      for (BasicBlock *BB : BBs) {
+      std::vector<unsigned> LocalSlots;
+      for (unsigned i = 0; i < BBs.size(); ++i)
+        LocalSlots.push_back(i);
+      for (size_t i = LocalSlots.size(); i > 1; --i)
+        std::swap(LocalSlots[i - 1], LocalSlots[cryptoutils->get_range(i)]);
+
+      for (unsigned LogicalSlot = 0; LogicalSlot < BBs.size(); ++LogicalSlot) {
         BBEncInfo Info;
         Info.key1 = cryptoutils->get_uint64_t();
         Info.key2 = cryptoutils->get_uint64_t();
@@ -202,89 +340,75 @@ PreservedAnalyses EnhancedIndirectBranchPass::run(Function &F,
         Info.variant = cryptoutils->get_range(0, 3);
         LocalKeys.push_back(Info);
 
-        // 编译时加密: combined = (key1 ^ key2) + (key3 ^ key4)
-        Constant *BA = BlockAddress::get(BB->getParent(), BB);
-        Constant *CE = ConstantExpr::getBitCast(BA, Int8PtrTy);
-        Constant *AsInt = ConstantExpr::getPtrToInt(CE, intType);
-        uint64_t combinedKey = (Info.key1 ^ Info.key2) + (Info.key3 ^ Info.key4);
-        Constant *Added = ConstantExpr::getAdd(AsInt, ConstantInt::get(intType, combinedKey));
-        Constant *Encrypted = ConstantExpr::getIntToPtr(Added, Int8PtrTy);
-        LocalElements.push_back(Encrypted);
+        Constant *Garbage = ConstantExpr::getIntToPtr(
+            ConstantInt::get(intType, cryptoutils->get_uint64_t()), Int8PtrTy);
+        LocalElements.push_back(Garbage);
       }
 
       ArrayType *LocalATy = ArrayType::get(Int8PtrTy, LocalElements.size());
       Constant *LocalCA =
           ConstantArray::get(LocalATy, ArrayRef<Constant *>(LocalElements));
-      std::string LocalName =
-          ".eibr_local_" + std::to_string(cryptoutils->get_uint32_t());
+      std::string LocalName = createObfuscatedName(*M);
       LoadFrom = new GlobalVariable(*M, LocalATy, false,
                                      GlobalValue::LinkageTypes::PrivateLinkage,
                                      LocalCA, LocalName);
+      writeObfuscationMetadata(LoadFrom, "nipass.generated");
       appendToCompilerUsed(*M, {LoadFrom});
 
-      // 条件分支：index = zext(condition)；无条件分支：index = 0
-      Value *zext;
-      if (BI->isConditional()) {
-        Value *condition = BI->getCondition();
-        zext = IRBBI.CreateZExt(condition, intType);
-      } else {
-        zext = ConstantInt::get(intType, 0);
+      for (unsigned LogicalSlot = 0; LogicalSlot < BBs.size(); ++LogicalSlot) {
+        Value *Idx = ConstantInt::get(intType, LocalSlots[LogicalSlot]);
+        Value *GEP =
+            IRBBI.CreateGEP(LoadFrom->getValueType(), LoadFrom, {zero, Idx});
+        Value *EncPtr = emitEncryptedBlockAddress(
+            IRBBI, BBs[LogicalSlot], LocalKeys[LogicalSlot], intType, Ctx);
+        IRBBI.CreateStore(EncPtr, GEP);
       }
 
-      Value *LocalIndex;
+      AllocaInst *LoadFromAI = nullptr;
       if (useStack) {
-        AllocaInst *LoadFromAI = IRBEntry.CreateAlloca(LoadFrom->getType());
+        LoadFromAI = IRBEntry.CreateAlloca(LoadFrom->getType());
         IRBEntry.CreateStore(LoadFrom, LoadFromAI);
-        AllocaInst *condAI = IRBEntry.CreateAlloca(intType);
-        IRBBI.CreateStore(zext, condAI);
+      }
 
-        LoadInst *LILoadFrom =
-            IRBBI.CreateLoad(LoadFrom->getType(), LoadFromAI);
-        Value *condLoad = IRBBI.CreateLoad(intType, condAI);
-        Value *GEP = IRBBI.CreateGEP(LoadFrom->getValueType(), LILoadFrom,
-                                      {zero, condLoad});
-        LocalIndex = condLoad;
-        Value *EncPtr = IRBBI.CreateLoad(Int8PtrTy, GEP);
+      auto CreateLocalDecodeBlock = [&](unsigned LogicalSlot) -> BasicBlock * {
+        BasicBlock *DecodeBB = BasicBlock::Create(Ctx, "", &F);
+        IRBuilder<NoFolder> DecodeIRB(DecodeBB);
+        Value *TablePtr = LoadFrom;
+        if (useStack)
+          TablePtr = DecodeIRB.CreateLoad(LoadFrom->getType(), LoadFromAI);
+        Value *Idx = ConstantInt::get(intType, LocalSlots[LogicalSlot]);
+        Value *GEP = DecodeIRB.CreateGEP(LoadFrom->getValueType(), TablePtr,
+                                         {zero, Idx});
+        Value *EncPtr = DecodeIRB.CreateLoad(Int8PtrTy, GEP);
+        Value *DecPtr =
+            emitDecrypt4Key(DecodeIRB, EncPtr, LocalKeys[LogicalSlot],
+                            intType, Ctx);
 
-        // 根据 index 选择对应的密钥解密
-        // 条件分支只有 0/1 两个索引，用 select 选择密钥
-        const BBEncInfo &Info0 = LocalKeys[0];
-        const BBEncInfo &Info1 = LocalKeys.size() > 1 ? LocalKeys[1] : Info0;
-        Value *DecPtr0 = emitDecrypt4Key(IRBBI, EncPtr, Info0, intType, Ctx);
-        Value *DecPtr1 = emitDecrypt4Key(IRBBI, EncPtr, Info1, intType, Ctx);
-        Value *IsZero = IRBBI.CreateICmpEQ(condLoad, zero);
-        Value *DecPtr = IRBBI.CreateSelect(IsZero, DecPtr0, DecPtr1);
+        IndirectBrInst *indirBr = IndirectBrInst::Create(DecPtr, 1, DecodeBB);
+        indirBr->addDestination(BBs[LogicalSlot]);
+        redirectPHIIncomingBlock(BBs[LogicalSlot], BI->getParent(), DecodeBB);
+        return DecodeBB;
+      };
 
-        IndirectBrInst *indirBr = IndirectBrInst::Create(DecPtr, BBs.size());
-        for (BasicBlock *BB : BBs)
-          indirBr->addDestination(BB);
-        ReplaceInstWithInst(BI, indirBr);
+      if (BI->isConditional()) {
+        BasicBlock *FalseDecodeBB = CreateLocalDecodeBlock(0);
+        BasicBlock *TrueDecodeBB = CreateLocalDecodeBlock(1);
+        BranchInst *NewBr =
+            BranchInst::Create(TrueDecodeBB, FalseDecodeBB,
+                               BI->getCondition());
+        ReplaceInstWithInst(BI, NewBr);
       } else {
-        Value *GEP = IRBBI.CreateGEP(LoadFrom->getValueType(), LoadFrom,
-                                      {zero, zext});
-        Value *EncPtr = IRBBI.CreateLoad(Int8PtrTy, GEP);
-
-        const BBEncInfo &Info0 = LocalKeys[0];
-        const BBEncInfo &Info1 = LocalKeys.size() > 1 ? LocalKeys[1] : Info0;
-        Value *DecPtr0 = emitDecrypt4Key(IRBBI, EncPtr, Info0, intType, Ctx);
-        Value *DecPtr1 = emitDecrypt4Key(IRBBI, EncPtr, Info1, intType, Ctx);
-        Value *IsZero = IRBBI.CreateICmpEQ(zext, zero);
-        Value *DecPtr = IRBBI.CreateSelect(IsZero, DecPtr0, DecPtr1);
-
-        IndirectBrInst *indirBr = IndirectBrInst::Create(DecPtr, BBs.size());
-        for (BasicBlock *BB : BBs)
-          indirBr->addDestination(BB);
-        ReplaceInstWithInst(BI, indirBr);
+        BasicBlock *DecodeBB = CreateLocalDecodeBlock(0);
+        ReplaceInstWithInst(BI, BranchInst::Create(DecodeBB));
       }
     } else {
       // === 无条件分支 → 使用全局表 ===
       BasicBlock *Target = BI->getSuccessor(0);
       unsigned realIdx = indexmap[Target];
-      uint64_t encodedIdx = realIdx ^ indexKey;
-
-      Value *EncodedIdxVal = ConstantInt::get(intType, encodedIdx);
-      Value *IdxKeyVal = emitSplitKey(IRBBI, indexKey, intType);
-      Value *RealIdxVal = IRBBI.CreateXor(EncodedIdxVal, IdxKeyVal);
+      uint64_t encodedIdx =
+          encodeBranchIndex(realIdx, indexCodec, intType->getBitWidth());
+      Value *RealIdxVal =
+          emitDecodeBranchIndex(IRBBI, encodedIdx, indexCodec, intType);
 
       if (useStack) {
         AllocaInst *LoadFromAI = IRBEntry.CreateAlloca(GlobalTable->getType());

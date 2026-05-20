@@ -2,6 +2,8 @@
 // [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 //===----------------------------------------------------------------------===//
 #include "Utils.h"
+#include "CryptoUtils.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -20,6 +22,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Operator.h"
 
 using namespace llvm;
 
@@ -201,6 +204,55 @@ bool toObfuscateBoolOption(Function *f, std::string option, bool *val) {
 // 混淆元数据的标识符
 static const char obfkindid[] = "MD_obf";
 
+std::string createObfuscatedName(Module &M, StringRef Prefix) {
+  std::string Name;
+  do {
+    Name = Prefix.str() + std::to_string(cryptoutils->get_uint64_t());
+  } while (M.getNamedValue(Name) != nullptr);
+  return Name;
+}
+
+bool readObfuscationMetadata(const GlobalObject *GO, StringRef annotation) {
+  if (!GO)
+    return false;
+
+  MDNode *Existing = GO->getMetadata(obfkindid);
+  if (!Existing)
+    return false;
+
+  MDTuple *Tuple = cast<MDTuple>(Existing);
+  for (auto &N : Tuple->operands()) {
+    if (cast<MDString>(N.get())->getString() == annotation)
+      return true;
+  }
+  return false;
+}
+
+void writeObfuscationMetadata(GlobalObject *GO, StringRef annotation) {
+  if (!GO)
+    return;
+
+  LLVMContext &Context = GO->getContext();
+  MDBuilder MDB(Context);
+
+  MDNode *Existing = GO->getMetadata(obfkindid);
+  SmallVector<Metadata *, 4> Names;
+  bool AppendName = true;
+  if (Existing) {
+    MDTuple *Tuple = cast<MDTuple>(Existing);
+    for (auto &N : Tuple->operands()) {
+      if (cast<MDString>(N.get())->getString() == annotation)
+        AppendName = false;
+      Names.emplace_back(N.get());
+    }
+  }
+
+  if (AppendName)
+    Names.emplace_back(MDB.createString(annotation));
+
+  GO->setMetadata(obfkindid, MDTuple::get(Context, Names));
+}
+
 // 从元数据中读取uint32类型的选项值
 bool readAnnotationMetadataUint32OptVal(Function *f, std::string opt,
                                         uint32_t *val) {
@@ -367,6 +419,24 @@ static inline std::vector<std::string> splitString(std::string str) {
   return words;
 }
 
+static GlobalValue *stripAnnotationGlobal(Value *V) {
+  if (!V)
+    return nullptr;
+  V = V->stripPointerCasts();
+  if (auto *GV = dyn_cast<GlobalValue>(V))
+    return GV;
+  if (auto *CE = dyn_cast<ConstantExpr>(V))
+    return dyn_cast<GlobalValue>(CE->getOperand(0)->stripPointerCasts());
+  return nullptr;
+}
+
+static ConstantDataSequential *getGlobalStringInitializer(Value *V) {
+  auto *GV = dyn_cast_or_null<GlobalVariable>(stripAnnotationGlobal(V));
+  if (!GV || !GV->hasInitializer())
+    return nullptr;
+  return dyn_cast<ConstantDataSequential>(GV->getInitializer());
+}
+
 // 将函数注解转换为LLVM元数据
 void annotation2Metadata(Module &M) {
   // 获取全局注解变量
@@ -380,16 +450,12 @@ void annotation2Metadata(Module &M) {
   for (unsigned int i = 0; i < C->getNumOperands(); i++)
     if (ConstantStruct *CS = dyn_cast<ConstantStruct>(C->getOperand(i))) {
       // 获取注解字符串
-      GlobalValue *StrC =
-          dyn_cast<GlobalValue>(CS->getOperand(1)->stripPointerCasts());
-      if (!StrC)
-        continue;
       ConstantDataSequential *StrData =
-          dyn_cast<ConstantDataSequential>(StrC->getOperand(0));
+          getGlobalStringInitializer(CS->getOperand(1));
       if (!StrData)
         continue;
       // 获取被注解的函数
-      Function *Fn = dyn_cast<Function>(CS->getOperand(0)->stripPointerCasts());
+      Function *Fn = dyn_cast<Function>(stripAnnotationGlobal(CS->getOperand(0)));
       if (!Fn)
         continue;
 
@@ -399,6 +465,35 @@ void annotation2Metadata(Module &M) {
       for (std::string str : strs)
         writeAnnotationMetadata(Fn, str);
     }
+}
+
+void stripObfuscationAnnotations(Module &M) {
+  GlobalVariable *Annotations = M.getGlobalVariable("llvm.global.annotations");
+  if (!Annotations || !Annotations->hasInitializer())
+    return;
+
+  SmallPtrSet<GlobalVariable *, 16> AnnotationStrings;
+  if (auto *C = dyn_cast<ConstantArray>(Annotations->getInitializer())) {
+    for (unsigned int i = 0; i < C->getNumOperands(); i++) {
+      auto *CS = dyn_cast<ConstantStruct>(C->getOperand(i));
+      if (!CS)
+        continue;
+      if (auto *GV =
+              dyn_cast_or_null<GlobalVariable>(stripAnnotationGlobal(CS->getOperand(1))))
+        AnnotationStrings.insert(GV);
+    }
+  }
+
+  Annotations->dropAllReferences();
+  Annotations->eraseFromParent();
+
+  for (GlobalVariable *GV : AnnotationStrings) {
+    GV->removeDeadConstantUsers();
+    if (GV->getNumUses() == 0) {
+      GV->dropAllReferences();
+      GV->eraseFromParent();
+    }
+  }
 }
 
 // 读取函数的注解元数据
@@ -422,22 +517,24 @@ int readdiyAnnotationMetadata(Function *f, std::string annotation) {
   if (!Annotations)
     return false;
   // 获取注解数组
-  ConstantArray *AnnotationsArray = cast<ConstantArray>(Annotations->getInitializer());
+  ConstantArray *AnnotationsArray = dyn_cast<ConstantArray>(Annotations->getInitializer());
+  if (!AnnotationsArray)
+    return false;
   // 遍历注解数组
   for (unsigned int i = 0; i < AnnotationsArray->getNumOperands(); i++) {
     // 获取注解结构体
-    ConstantStruct *AnnotationStruct = cast<ConstantStruct>(AnnotationsArray->getOperand(i));
-    // 获取注解字符串
-    GlobalValue *StrC =
-          dyn_cast<GlobalValue>(AnnotationStruct->getOperand(1)->stripPointerCasts());
-    if (!StrC)
+    ConstantStruct *AnnotationStruct =
+        dyn_cast<ConstantStruct>(AnnotationsArray->getOperand(i));
+    if (!AnnotationStruct)
       continue;
+    // 获取注解字符串
     ConstantDataSequential *StrData =
-          dyn_cast<ConstantDataSequential>(StrC->getOperand(0));
+        getGlobalStringInitializer(AnnotationStruct->getOperand(1));
     if (!StrData)
       continue;
     //获取注解函数
-    Function *Fn = dyn_cast<Function>(AnnotationStruct->getOperand(0)->stripPointerCasts());
+    Function *Fn =
+        dyn_cast<Function>(stripAnnotationGlobal(AnnotationStruct->getOperand(0)));
     // 如果注解函数与目标函数相同，并且注解字符串与目标注解相同，则返回true
     if (Fn == f ) {
       std::string str = StrData->getAsCString().str();

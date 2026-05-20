@@ -5,7 +5,6 @@ cmake_minimum_required(VERSION 3.18)
 # # 设置动态库输出位置
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 set(CMAKE_CXX_STANDARD 17)
-project(MyPass)
 
 set(platform_name "android")
 
@@ -15,23 +14,17 @@ if(platform_name STREQUAL "x86")
         set(CMAKE_C_COMPILER $ENV{CLANG_PATH})
         message(STATUS "使用环境变量指定的 C 编译器: $ENV{CLANG_PATH}")
     else()
-        # 优先从 LLVM_HOME 中查找 clang
-        if(DEFINED ENV{LLVM_HOME} AND EXISTS $ENV{LLVM_HOME}/bin/clang)
-            set(CMAKE_C_COMPILER $ENV{LLVM_HOME}/bin/clang)
-            message(STATUS "使用 LLVM_HOME 中的 C 编译器: $ENV{LLVM_HOME}/bin/clang")
+        # x86 本地测试统一使用系统 LLVM，避免误用 Android prebuilts。
+        find_program(CLANG_PROGRAM
+            NAMES clang-19 clang
+            PATHS /usr/bin /usr/local/bin
+        )
+        if(CLANG_PROGRAM)
+            set(CMAKE_C_COMPILER ${CLANG_PROGRAM})
+            message(STATUS "找到系统 C 编译器: ${CLANG_PROGRAM}")
         else()
-            # 尝试从系统路径查找带版本的 clang
-            find_program(CLANG_PROGRAM
-                NAMES  clang-21
-                PATHS /usr/bin /usr/local/bin
-            )
-            if(CLANG_PROGRAM)
-                set(CMAKE_C_COMPILER ${CLANG_PROGRAM})
-                message(STATUS "找到系统 C 编译器: ${CLANG_PROGRAM}")
-            else()
-                set(CMAKE_C_COMPILER clang-18)
-                message(STATUS "使用默认 C 编译器: clang-18")
-            endif()
+            set(CMAKE_C_COMPILER clang)
+            message(STATUS "使用默认 C 编译器: clang")
         endif()
     endif()
     
@@ -39,24 +32,21 @@ if(platform_name STREQUAL "x86")
         set(CMAKE_CXX_COMPILER $ENV{CLANGXX_PATH})
         message(STATUS "使用环境变量指定的 C++ 编译器: $ENV{CLANGXX_PATH}")
     else()
-        # 优先从 LLVM_HOME 中查找 clang++
-        if(DEFINED ENV{LLVM_HOME} AND EXISTS $ENV{LLVM_HOME}/bin/clang++)
-            set(CMAKE_CXX_COMPILER $ENV{LLVM_HOME}/bin/clang++)
-            message(STATUS "使用 LLVM_HOME 中的 C++ 编译器: $ENV{LLVM_HOME}/bin/clang++")
+        find_program(CLANGXX_PROGRAM
+            NAMES clang++-19 clang++
+            PATHS /usr/bin /usr/local/bin
+        )
+        if(CLANGXX_PROGRAM)
+            set(CMAKE_CXX_COMPILER ${CLANGXX_PROGRAM})
+            message(STATUS "找到系统 C++ 编译器: ${CLANGXX_PROGRAM}")
         else()
-            # 尝试从系统路径查找带版本的 clang++
-            find_program(CLANGXX_PROGRAM
-                NAMES clang++-21 clang++-20 clang++-19 clang++-18 clang++-17 clang++-16 clang++-15 clang++-14 clang++-12 clang++
-                PATHS /usr/bin /usr/local/bin
-            )
-            if(CLANGXX_PROGRAM)
-                set(CMAKE_CXX_COMPILER ${CLANGXX_PROGRAM})
-                message(STATUS "找到系统 C++ 编译器: ${CLANGXX_PROGRAM}")
-            else()
-                set(CMAKE_CXX_COMPILER clang++-18)
-                message(STATUS "使用默认 C++ 编译器: clang++-18")
-            endif()
+            set(CMAKE_CXX_COMPILER clang++)
+            message(STATUS "使用默认 C++ 编译器: clang++")
         endif()
+    endif()
+
+    if(NOT DEFINED LLVM_DIR AND EXISTS /usr/lib/llvm-19/lib/cmake/llvm)
+        set(LLVM_DIR /usr/lib/llvm-19/lib/cmake/llvm CACHE PATH "Path to LLVM cmake modules" FORCE)
     endif()
 
 else()
@@ -95,6 +85,8 @@ else()
 
 
 endif()
+
+project(MyPass)
 
 # 查找 LLVM 包
 # 如果通过 CMake 变量指定了 LLVM_DIR，优先使用
@@ -138,8 +130,6 @@ add_subdirectory(src)
 # # set(Z3_LIBRARIES "/usr/lib/x86_64-linux-gnu/libz3.so")
 
 # # include_directories(${Z3_INCLUDE_DIRS})
-
-
 
 
 

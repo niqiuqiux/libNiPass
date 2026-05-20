@@ -1,6 +1,8 @@
 #ifndef _UTILS_H_
 #define _UTILS_H_
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/IR/GlobalObject.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include <string>
@@ -17,6 +19,10 @@ bool hasApplePtrauth(Module *M);
 void FixFunctionConstantExpr(Function *F);
 void turnOffOptimization(Function *f);
 void annotation2Metadata(Module &M);
+void stripObfuscationAnnotations(Module &M);
+std::string createObfuscatedName(Module &M, StringRef Prefix = ".x");
+bool readObfuscationMetadata(const GlobalObject *GO, StringRef annotation);
+void writeObfuscationMetadata(GlobalObject *GO, StringRef annotation);
 bool readAnnotationMetadata(Function *f, std::string annotation);
 int readdiyAnnotationMetadata(Function *f, std::string annotation);
 void writeAnnotationMetadata(Function *f, std::string annotation);

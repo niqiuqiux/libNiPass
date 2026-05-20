@@ -12,7 +12,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-PASS_LIB="${PROJECT_ROOT}/lib/libNiPass-19.0.0.so"
+PASS_LIB="${NIPASS_LIB:-${PROJECT_ROOT}/lib/libNiPass-19.0.0.so}"
+NIPASS_PASSES="${NIPASS_PASSES:--enfla}"
 
 BUILD_OBF="${SCRIPT_DIR}/build_obf"
 BUILD_PLAIN="${SCRIPT_DIR}/build_plain"
@@ -35,7 +36,8 @@ do_build() {
 
     cmake -S "$SCRIPT_DIR" -B "$build_dir" \
         -DENABLE_OBFUSCATION="${enable_obf}" \
-        -DNIPASS_LIB="${PASS_LIB}" 2>&1
+        -DNIPASS_LIB="${PASS_LIB}" \
+        -DNIPASS_PASSES="${NIPASS_PASSES}" 2>&1
 
     cmake --build "$build_dir" -- -j$(nproc) 2>&1
 

@@ -45,6 +45,27 @@ struct VMTypeMap {
     unsigned int VmNop;
 };
 
+/// 每函数随机 bytecode 布局。pc 是 i32 数组下标，不是字节偏移。
+struct VMBytecodeLayout {
+    unsigned int TypeSlot;
+    unsigned int Op1Slot;
+    unsigned int Op2Slot;
+    unsigned int Stride;
+};
+
+/// 每函数随机 bytecode key stream 配置。FlatIndex 是 i32 数组下标。
+struct VMBytecodeCipher {
+    uint32_t Seed;
+    uint32_t Mul;
+    uint32_t Inc;
+    uint32_t Salt1;
+    uint32_t Salt2;
+    unsigned int Rot1;
+    unsigned int Rot2;
+    unsigned int Shift;
+    unsigned int Variant;
+};
+
 /// 增强版 VM 平坦化 Pass
 class EnVMFlattenPass : public llvm::PassInfoMixin<EnVMFlattenPass> {
 public:
@@ -57,10 +78,17 @@ public:
 private:
     // 每函数随机状态
     VMTypeMap currentTypeMap;
+    VMBytecodeLayout currentLayout;
+    VMBytecodeCipher currentCipher;
     uint32_t currentOperandKey;
 
     // 随机化指令类型编码
     VMTypeMap generateTypeMap();
+    VMBytecodeLayout generateBytecodeLayout();
+    VMBytecodeCipher generateBytecodeCipher();
+    uint32_t computeBytecodeKey(uint32_t flatIndex) const;
+    llvm::Value *emitBytecodeKey(llvm::IRBuilder<> &IRB, llvm::Value *flatIndex,
+                                 llvm::IntegerType *i32Ty) const;
 
     // 基本块收集
     std::vector<llvm::BasicBlock *> *getBlocks(llvm::Function *function, std::vector<llvm::BasicBlock *> *lists);

@@ -20,7 +20,6 @@ cmake --build .
 | `-enfla` | `enfla` | 增强控制流平坦化 |
 | `-envmf` | `envmf` | 增强 VM 平坦化 |
 | `-eicall` | `eicall` | 增强间接调用 |
-| `-eigv` | `eigv` | 增强间接全局变量 |
 | `-eibr` | `eibr` | 增强间接分支 |
 
 ## 使用方式
@@ -39,7 +38,7 @@ clang-19 -fplugin=./lib/libNiPass-19.0.0.so -O1 \
 # 开启全部 pass
 clang-19 -fplugin=./lib/libNiPass-19.0.0.so -O1 \
   -mllvm -enstrenc -mllvm -enfla -mllvm -envmf \
-  -mllvm -eicall -mllvm -eigv -mllvm -eibr \
+  -mllvm -eicall -mllvm -eibr \
   test.c -o test
 ```
 
@@ -129,7 +128,7 @@ cmake --build build -j$(nproc)
 
 ```bash
 cmake -S testarm64 -B build \
-  -DNIPASS_PASSES="-enstrenc;-enfla;-envmf;-eicall;-eigv;-eibr"
+  -DNIPASS_PASSES="-enstrenc;-enfla;-envmf;-eicall;-eibr"
 cmake --build build -j$(nproc)
 ```
 

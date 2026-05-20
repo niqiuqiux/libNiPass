@@ -4,28 +4,72 @@
 #include "CryptoUtils.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/NoFolder.h"
+#include <algorithm>
 
 using namespace llvm;
 
 namespace ni_pass {
 
+template <typename IRBuilderTy>
+static Value *emitRuntimeNoise(IRBuilderTy &IRB, IntegerType *intType) {
+  AllocaInst *Slot = nullptr;
+  if (BasicBlock *InsertBB = IRB.GetInsertBlock()) {
+    if (Function *Fn = InsertBB->getParent()) {
+      BasicBlock &Entry = Fn->getEntryBlock();
+      BasicBlock::iterator InsertPt = Entry.getFirstInsertionPt();
+      if (InsertPt == Entry.end()) {
+        IRBuilder<NoFolder> AllocaIRB(&Entry);
+        Slot = AllocaIRB.CreateAlloca(intType);
+      } else {
+        IRBuilder<NoFolder> AllocaIRB(&*InsertPt);
+        Slot = AllocaIRB.CreateAlloca(intType);
+      }
+    }
+  }
+  if (!Slot)
+    Slot = IRB.CreateAlloca(intType);
+  Slot->setAlignment(Align(std::max<uint64_t>(1, intType->getBitWidth() / 8)));
+  auto *Seed = ConstantInt::get(intType, cryptoutils->get_uint64_t());
+  IRB.CreateStore(Seed, Slot)->setVolatile(true);
+  LoadInst *Load = IRB.CreateLoad(intType, Slot);
+  Load->setVolatile(true);
+  return IRB.CreateXor(Load, Seed);
+}
+
+template <typename IRBuilderTy>
+static Value *emitOpaqueConst(IRBuilderTy &IRB, IntegerType *intType,
+                              uint64_t value) {
+  Value *Noise = emitRuntimeNoise(IRB, intType);
+  return IRB.CreateXor(ConstantInt::get(intType, value), Noise);
+}
+
 // 运行时密钥拆分：将一个密钥拆分为 2~3 个部分通过 XOR 合成
 template <typename IRBuilderTy>
 static Value *emitSplitKey(IRBuilderTy &IRB, uint64_t key, IntegerType *intType) {
-  uint32_t numParts = cryptoutils->get_range(2, 4); // 2 or 3
+  uint32_t numParts = cryptoutils->get_range(2, 5); // 2, 3 or 4
   if (numParts == 2) {
     uint64_t a = cryptoutils->get_uint64_t();
     uint64_t b = key ^ a;
-    return IRB.CreateXor(ConstantInt::get(intType, a),
-                         ConstantInt::get(intType, b));
-  } else {
+    return IRB.CreateXor(emitOpaqueConst(IRB, intType, a),
+                         emitOpaqueConst(IRB, intType, b));
+  } else if (numParts == 3) {
     uint64_t a = cryptoutils->get_uint64_t();
     uint64_t b = cryptoutils->get_uint64_t();
     uint64_t c = key ^ a ^ b;
-    return IRB.CreateXor(
-        IRB.CreateXor(ConstantInt::get(intType, a),
-                      ConstantInt::get(intType, b)),
-        ConstantInt::get(intType, c));
+    Value *Left = IRB.CreateXor(emitOpaqueConst(IRB, intType, a),
+                                emitOpaqueConst(IRB, intType, b));
+    return IRB.CreateXor(Left, emitOpaqueConst(IRB, intType, c));
+  } else {
+    uint64_t a = cryptoutils->get_uint64_t();
+    uint64_t b = cryptoutils->get_uint64_t();
+    uint64_t c = cryptoutils->get_uint64_t();
+    uint64_t d = key ^ a ^ b ^ c;
+    Value *Left = IRB.CreateXor(emitOpaqueConst(IRB, intType, a),
+                                emitOpaqueConst(IRB, intType, b));
+    Value *Right = IRB.CreateXor(emitOpaqueConst(IRB, intType, c),
+                                 emitOpaqueConst(IRB, intType, d));
+    return IRB.CreateXor(Left, Right);
   }
 }
 

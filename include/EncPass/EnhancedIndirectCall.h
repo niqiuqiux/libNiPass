@@ -38,6 +38,7 @@ public:
   std::vector<Function *> Callees;
   std::map<Function *, unsigned> CalleeNumbering;
   std::map<Function *, CalleeEncInfo> CalleeKeys;
+  std::map<Function *, unsigned> CalleeSlots;
 
   EnhancedIndirectCallPass(bool flag) {
     this->flag = flag;

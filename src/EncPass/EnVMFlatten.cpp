@@ -3,6 +3,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #define DEBUG_TYPE "envmflatten"
 
@@ -19,6 +20,7 @@ PreservedAnalyses EnVMFlattenPass::run(Function &F, FunctionAnalysisManager &FAM
     if (toObfuscate(flag, tmp, "envmf")) {
         LLVM_DEBUG(dbgs() << "\033[1;32m[EnVMFlattening] Function : " << F.getName() << "\033[0m\n");
         DoFlatten(tmp);
+        writeObfuscationMetadata(tmp, "envmf.applied");
         return PreservedAnalyses::none();
     }
     return PreservedAnalyses::all();
@@ -94,6 +96,105 @@ VMTypeMap EnVMFlattenPass::generateTypeMap() {
     return m;
 }
 
+VMBytecodeLayout EnVMFlattenPass::generateBytecodeLayout() {
+    VMBytecodeLayout L;
+    std::vector<unsigned int> slots = {0, 1, 2};
+    for (size_t i = slots.size(); i > 1; --i)
+        std::swap(slots[i - 1], slots[cryptoutils->get_range(i)]);
+
+    L.TypeSlot = slots[0];
+    L.Op1Slot = slots[1];
+    L.Op2Slot = slots[2];
+    L.Stride = 3 + cryptoutils->get_range(0, 4);
+    return L;
+}
+
+VMBytecodeCipher EnVMFlattenPass::generateBytecodeCipher() {
+    VMBytecodeCipher C;
+    C.Seed = cryptoutils->get_uint32_t();
+    C.Mul = cryptoutils->get_uint32_t() | 1;
+    C.Inc = cryptoutils->get_uint32_t() | 1;
+    C.Salt1 = cryptoutils->get_uint32_t();
+    C.Salt2 = cryptoutils->get_uint32_t();
+    C.Rot1 = 1 + cryptoutils->get_range(0, 31);
+    C.Rot2 = 1 + cryptoutils->get_range(0, 31);
+    C.Shift = 3 + cryptoutils->get_range(0, 13);
+    C.Variant = cryptoutils->get_range(0, 3);
+    return C;
+}
+
+static uint32_t rotateLeft32(uint32_t value, unsigned int amount) {
+    amount &= 31;
+    return amount == 0 ? value : ((value << amount) | (value >> (32 - amount)));
+}
+
+uint32_t EnVMFlattenPass::computeBytecodeKey(uint32_t flatIndex) const {
+    uint32_t key = currentCipher.Seed +
+                   flatIndex * currentCipher.Mul +
+                   currentCipher.Inc;
+    switch (currentCipher.Variant) {
+    case 0:
+        key = rotateLeft32(key ^ currentCipher.Salt1, currentCipher.Rot1);
+        key += currentCipher.Salt2;
+        key ^= key >> currentCipher.Shift;
+        break;
+    case 1:
+        key = rotateLeft32(key + currentCipher.Salt1, currentCipher.Rot1);
+        key ^= currentCipher.Salt2;
+        key = rotateLeft32(key, currentCipher.Rot2);
+        break;
+    default:
+        key ^= rotateLeft32(flatIndex + currentCipher.Salt1,
+                            currentCipher.Rot1);
+        key += rotateLeft32(currentCipher.Salt2, currentCipher.Rot2);
+        key ^= key >> currentCipher.Shift;
+        break;
+    }
+    return key;
+}
+
+Value *EnVMFlattenPass::emitBytecodeKey(IRBuilder<> &IRB, Value *flatIndex,
+                                        IntegerType *i32Ty) const {
+    auto Const = [&](uint32_t V) { return ConstantInt::get(i32Ty, V); };
+    auto RotL = [&](Value *V, unsigned int Amount) -> Value * {
+        Amount &= 31;
+        if (Amount == 0)
+            return V;
+        Value *L = IRB.CreateShl(V, Const(Amount));
+        Value *R = IRB.CreateLShr(V, Const(32 - Amount));
+        return IRB.CreateOr(L, R);
+    };
+
+    Value *key = IRB.CreateAdd(
+        IRB.CreateAdd(Const(currentCipher.Seed),
+                      IRB.CreateMul(flatIndex, Const(currentCipher.Mul))),
+        Const(currentCipher.Inc));
+
+    switch (currentCipher.Variant) {
+    case 0:
+        key = RotL(IRB.CreateXor(key, Const(currentCipher.Salt1)),
+                   currentCipher.Rot1);
+        key = IRB.CreateAdd(key, Const(currentCipher.Salt2));
+        key = IRB.CreateXor(key, IRB.CreateLShr(key, Const(currentCipher.Shift)));
+        break;
+    case 1:
+        key = RotL(IRB.CreateAdd(key, Const(currentCipher.Salt1)),
+                   currentCipher.Rot1);
+        key = IRB.CreateXor(key, Const(currentCipher.Salt2));
+        key = RotL(key, currentCipher.Rot2);
+        break;
+    default:
+        key = IRB.CreateXor(
+            key, RotL(IRB.CreateAdd(flatIndex, Const(currentCipher.Salt1)),
+                      currentCipher.Rot1));
+        key = IRB.CreateAdd(key, RotL(Const(currentCipher.Salt2),
+                                      currentCipher.Rot2));
+        key = IRB.CreateXor(key, IRB.CreateLShr(key, Const(currentCipher.Shift)));
+        break;
+    }
+    return key;
+}
+
 // ============================================================
 // 指令生成（使用 currentTypeMap）
 // ============================================================
@@ -115,7 +216,7 @@ void EnVMFlattenPass::gen_inst(std::vector<EnVMInst *> *all_inst,
             create_node_inst(all_inst, inst_map, node->bb1);
             gen_inst(all_inst, inst_map, node->bb1);
         } else {
-            unsigned int addr = (*inst_map->find(node->bb1)).second * 3;
+            unsigned int addr = (*inst_map->find(node->bb1)).second * currentLayout.Stride;
             EnVMInst *code = newInst(currentTypeMap.JmpBoring, addr, 0);
             all_inst->push_back(code);
         }
@@ -154,8 +255,8 @@ void EnVMFlattenPass::gen_inst(std::vector<EnVMInst *> *all_inst,
             gen_inst(all_inst, inst_map, node->bb2);
         }
 
-        code->op1 = (*inst_map->find(node->bb1)).second * 3;
-        code->op2 = (*inst_map->find(node->bb2)).second * 3;
+        code->op1 = (*inst_map->find(node->bb1)).second * currentLayout.Stride;
+        code->op2 = (*inst_map->find(node->bb2)).second * currentLayout.Stride;
     }
 }
 
@@ -179,12 +280,12 @@ void EnVMFlattenPass::dump_inst(std::vector<EnVMInst *> *all_inst) {
 
 unsigned int EnVMFlattenPass::insertDummyInstructions(std::vector<EnVMInst *> *all_inst) {
     std::vector<EnVMInst *> newList;
-    // oldByteOffset → newByteOffset 映射（以 *3 为单位的字节偏移）
+    // oldOffset -> newOffset 映射（以 i32 数组下标为单位）
     std::map<unsigned int, unsigned int> offsetMap;
 
     // 第一遍：插入 dummy，建立偏移映射
     for (unsigned int i = 0; i < all_inst->size(); i++) {
-        unsigned int oldOffset = i * 3;
+        unsigned int oldOffset = i * currentLayout.Stride;
         // 在每条真实指令前插入 1-3 条 NOP
         unsigned int nopCount = 1 + (cryptoutils->get_uint32_t() % 3);
         for (unsigned int j = 0; j < nopCount; j++) {
@@ -193,7 +294,7 @@ unsigned int EnVMFlattenPass::insertDummyInstructions(std::vector<EnVMInst *> *a
                                     cryptoutils->get_uint32_t());
             newList.push_back(nop);
         }
-        unsigned int newOffset = (unsigned int)(newList.size()) * 3;
+        unsigned int newOffset = (unsigned int)(newList.size()) * currentLayout.Stride;
         offsetMap[oldOffset] = newOffset;
         newList.push_back((*all_inst)[i]);
     }
@@ -260,11 +361,9 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
     // --- 增强 1: 随机化种子（使用 cryptoutils，不再 srand） ---
     // --- 增强 2: 多态调度器 ---
     currentTypeMap = generateTypeMap();
+    currentLayout = generateBytecodeLayout();
+    currentCipher = generateBytecodeCipher();
     currentOperandKey = cryptoutils->get_uint32_t();
-
-    // --- 增强 5: XOR 加密密钥 ---
-    uint32_t baseKey = cryptoutils->get_uint32_t();
-    uint32_t multiplier = cryptoutils->get_uint32_t() | 1; // 确保奇数
 
     std::vector<BasicBlock *> origBB;
     getBlocks(f, &origBB);
@@ -283,7 +382,7 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
         BasicBlock::iterator iter = oldEntry->end();
         iter--;
         if (oldEntry->size() > 1) iter--;
-        BasicBlock *splited = oldEntry->splitBasicBlock(iter, Twine("FirstBB"));
+        BasicBlock *splited = oldEntry->splitBasicBlock(iter, Twine(""));
         firstbb = splited;
         origBB.insert(origBB.begin(), splited);
     }
@@ -310,7 +409,7 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
             BasicBlock *elseBB = defaultDest;
             for (int i = (int)cases.size() - 1; i >= 1; i--) {
                 BasicBlock *newBB = BasicBlock::Create(
-                    f->getContext(), "sw.if", f, defaultDest);
+                    f->getContext(), "", f, defaultDest);
                 IRBuilder<> builder(newBB);
                 Value *cmp = builder.CreateICmpEQ(cond, cases[i].first);
                 builder.CreateCondBr(cmp, cases[i].second, elseBB);
@@ -368,38 +467,45 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
     // --- 增强 5: 序列化 + XOR 加密 ---
     std::vector<Constant *> opcodes;
     LLVMContext &ctx = f->getContext();
-    Type *i32Ty = Type::getInt32Ty(ctx);
+    IntegerType *i32Ty = Type::getInt32Ty(ctx);
 
     for (unsigned int i = 0; i < all_inst.size(); i++) {
         EnVMInst *inst = all_inst[i];
-        // 每条指令 3 个 uint32: type, op1, op2
-        uint32_t raw[3] = {inst->type, inst->op1, inst->op2};
-        for (int k = 0; k < 3; k++) {
-            uint32_t flatIdx = i * 3 + k;
-            uint32_t key_i = baseKey ^ (flatIdx * multiplier);
-            uint32_t encrypted = raw[k] ^ key_i;
+        std::vector<uint32_t> raw(currentLayout.Stride);
+        for (unsigned int k = 0; k < currentLayout.Stride; ++k)
+            raw[k] = cryptoutils->get_uint32_t();
+        raw[currentLayout.TypeSlot] = inst->type;
+        raw[currentLayout.Op1Slot] = inst->op1;
+        raw[currentLayout.Op2Slot] = inst->op2;
+
+        for (unsigned int k = 0; k < currentLayout.Stride; k++) {
+            uint32_t flatIdx = i * currentLayout.Stride + k;
+            uint32_t encrypted = raw[k] ^ computeBytecodeKey(flatIdx);
             opcodes.push_back(ConstantInt::get(i32Ty, encrypted));
         }
     }
 
     ArrayType *AT = ArrayType::get(i32Ty, opcodes.size());
     Constant *opcode_array = ConstantArray::get(AT, ArrayRef<Constant *>(opcodes));
+    std::string opcodeName = createObfuscatedName(*f->getParent());
     GlobalVariable *oparr_var = new GlobalVariable(
         *(f->getParent()), AT, false,
-        GlobalValue::LinkageTypes::PrivateLinkage, opcode_array, "en_opcodes");
+        GlobalValue::LinkageTypes::PrivateLinkage, opcode_array, opcodeName);
+    writeObfuscationMetadata(oparr_var, "nipass.generated");
+    appendToCompilerUsed(*(f->getParent()), {oparr_var});
 
     // 去除入口块末尾跳转
     oldEntry->getTerminator()->eraseFromParent();
 
     // 创建 VM 寄存器
-    AllocaInst *vm_pc = new AllocaInst(i32Ty, 0, Twine("VMpc"), oldEntry);
+    AllocaInst *vm_pc = new AllocaInst(i32Ty, 0, Twine(""), oldEntry);
     Constant *init_pc = ConstantInt::get(i32Ty, startOffset); // 使用 dummy 后的新起始偏移
     new StoreInst(init_pc, vm_pc, oldEntry);
 
-    AllocaInst *vm_flag = new AllocaInst(i32Ty, 0, Twine("VMJmpFlag"), oldEntry);
+    AllocaInst *vm_flag = new AllocaInst(i32Ty, 0, Twine(""), oldEntry);
 
     // 创建 VM 入口块
-    BasicBlock *vm_entry = BasicBlock::Create(ctx, "VMEntry", f, firstbb);
+    BasicBlock *vm_entry = BasicBlock::Create(ctx, "", f, firstbb);
     BranchInst::Create(vm_entry, oldEntry);
 
     // ---- 构建解释器（带 XOR 解密） ----
@@ -410,37 +516,42 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
     // 加载 vm_pc 一次
     Value *pcVal = IRB.CreateLoad(i32Ty, vm_pc);
 
-    // 计算 index = pc, pc+1, pc+2
-    Value *idx0 = pcVal;
-    Value *idx1 = IRB.CreateAdd(pcVal, ConstantInt::get(i32Ty, 1));
-    Value *idx2 = IRB.CreateAdd(pcVal, ConstantInt::get(i32Ty, 2));
+    // 根据每函数随机布局计算 type/op1/op2 所在槽位
+    Value *idxType = IRB.CreateAdd(
+        pcVal, ConstantInt::get(i32Ty, currentLayout.TypeSlot));
+    Value *idxOp1 = IRB.CreateAdd(
+        pcVal, ConstantInt::get(i32Ty, currentLayout.Op1Slot));
+    Value *idxOp2 = IRB.CreateAdd(
+        pcVal, ConstantInt::get(i32Ty, currentLayout.Op2Slot));
 
     // 加载 raw 密文
-    Value *rawType = IRB.CreateLoad(i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idx0}));
-    Value *rawOp1  = IRB.CreateLoad(i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idx1}));
-    Value *rawOp2  = IRB.CreateLoad(i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idx2}));
+    Value *rawType = IRB.CreateLoad(
+        i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idxType}));
+    Value *rawOp1 = IRB.CreateLoad(
+        i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idxOp1}));
+    Value *rawOp2 = IRB.CreateLoad(
+        i32Ty, IRB.CreateGEP(arrayTy, oparr_var, {zero, idxOp2}));
 
-    // 解密: key_i = baseKey ^ (index * multiplier)
-    Value *baseKeyVal = ConstantInt::get(i32Ty, baseKey);
-    Value *multVal    = ConstantInt::get(i32Ty, multiplier);
+    // 每个槽位使用当前函数随机 key stream 解密。
+    Value *keyType = emitBytecodeKey(IRB, idxType, i32Ty);
+    Value *keyOp1 = emitBytecodeKey(IRB, idxOp1, i32Ty);
+    Value *keyOp2 = emitBytecodeKey(IRB, idxOp2, i32Ty);
 
-    Value *key0 = IRB.CreateXor(baseKeyVal, IRB.CreateMul(idx0, multVal));
-    Value *key1 = IRB.CreateXor(baseKeyVal, IRB.CreateMul(idx1, multVal));
-    Value *key2 = IRB.CreateXor(baseKeyVal, IRB.CreateMul(idx2, multVal));
+    Value *optype = IRB.CreateXor(rawType, keyType);
+    Value *op1    = IRB.CreateXor(rawOp1, keyOp1);
+    Value *op2    = IRB.CreateXor(rawOp2, keyOp2);
 
-    Value *optype = IRB.CreateXor(rawType, key0);
-    Value *op1    = IRB.CreateXor(rawOp1, key1);
-    Value *op2    = IRB.CreateXor(rawOp2, key2);
-
-    // 更新 pc += 3
-    IRB.CreateStore(IRB.CreateAdd(pcVal, ConstantInt::get(i32Ty, 3)), vm_pc);
+    // 更新 pc += stride
+    IRB.CreateStore(
+        IRB.CreateAdd(pcVal, ConstantInt::get(i32Ty, currentLayout.Stride)),
+        vm_pc);
 
     // 创建处理块
-    BasicBlock *run_block   = BasicBlock::Create(ctx, "RunBlock", f, firstbb);
-    BasicBlock *jmp_boring  = BasicBlock::Create(ctx, "JmpBoring", f, firstbb);
-    BasicBlock *jmp_select  = BasicBlock::Create(ctx, "JmpSelect", f, firstbb);
-    BasicBlock *vm_nop      = BasicBlock::Create(ctx, "VMNop", f, firstbb);
-    BasicBlock *defaultCase = BasicBlock::Create(ctx, "Default", f, firstbb);
+    BasicBlock *run_block   = BasicBlock::Create(ctx, "", f, firstbb);
+    BasicBlock *jmp_boring  = BasicBlock::Create(ctx, "", f, firstbb);
+    BasicBlock *jmp_select  = BasicBlock::Create(ctx, "", f, firstbb);
+    BasicBlock *vm_nop      = BasicBlock::Create(ctx, "", f, firstbb);
+    BasicBlock *defaultCase = BasicBlock::Create(ctx, "", f, firstbb);
 
     BranchInst::Create(vm_entry, defaultCase);
     BranchInst::Create(vm_entry, vm_nop); // NOP 直接回 VMEntry
@@ -489,8 +600,8 @@ void EnVMFlattenPass::DoFlatten(Function *f) {
 
     // ---- JmpSelect: op1/op2 先 XOR 解码 ----
     IRB.SetInsertPoint(jmp_select);
-    BasicBlock *select_true  = BasicBlock::Create(ctx, "JmpSelectTrue", f, firstbb);
-    BasicBlock *select_false = BasicBlock::Create(ctx, "JmpSelectFalse", f, firstbb);
+    BasicBlock *select_true  = BasicBlock::Create(ctx, "", f, firstbb);
+    BasicBlock *select_false = BasicBlock::Create(ctx, "", f, firstbb);
     IRB.CreateCondBr(
         IRB.CreateICmpEQ(IRB.CreateLoad(i32Ty, vm_flag), ConstantInt::get(i32Ty, 1)),
         select_true, select_false);

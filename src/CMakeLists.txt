@@ -7,7 +7,6 @@ set(EncPass
     EncPass/FlatteningEnhanced.cpp
     EncPass/EnVMFlatten.cpp
     EncPass/EnhancedIndirectCall.cpp
-    EncPass/EnhancedIndirectGlobalVariable.cpp
     EncPass/EnhancedIndirectBranch.cpp
 )
 

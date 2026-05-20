@@ -4,6 +4,7 @@
 // 3. 多层异构加密  4. DecryptSpace生命周期管理  5. 独立副本(取消共享)
 //===----------------------------------------------------------------------===//
 #include "EncPass/EnhancedStringEncryption.h"
+#include "EncPass/EncryptUtils.h"
 #include "CryptoUtils.h"
 #include "SubstituteImpl.h"
 #include "Utils.h"
@@ -37,15 +38,28 @@ static uint32_t StrEncSubXorProbTemp = 50;
 static cl::opt<bool>
     StrEncCleanup("enstrcry_cleanup", cl::init(true), cl::NotHidden,
                   cl::desc("Zero DecryptSpace on function return"));
+static bool StrEncCleanupTemp = true;
 
 namespace ni_pass {
 
-static std::string createRandomGlobalName(Module &M, StringRef Prefix) {
-  std::string Name;
-  do {
-    Name = Prefix.str() + std::to_string(cryptoutils->get_uint64_t());
-  } while (M.getNamedValue(Name) != nullptr);
-  return Name;
+static uint64_t nextRollingKey(uint64_t key, uint64_t mul, uint64_t inc,
+                               unsigned bits) {
+  uint64_t mask = bits >= 64 ? ~0ULL : ((1ULL << bits) - 1);
+  key = (key * mul + inc) & mask;
+  key ^= (key >> ((bits >= 16) ? 7 : 3));
+  key &= mask;
+  return key;
+}
+
+static Value *emitNextRollingKey(IRBuilder<> &IRB, Value *key,
+                                 Value *mul, Value *inc,
+                                 IntegerType *intType) {
+  unsigned bits = intType->getBitWidth();
+  Value *next = IRB.CreateAdd(IRB.CreateMul(key, mul), inc);
+  next = IRB.CreateXor(next, IRB.CreateLShr(
+                                 next, ConstantInt::get(intType,
+                                                        bits >= 16 ? 7 : 3)));
+  return next;
 }
 
 //===----------------------------------------------------------------------===//
@@ -128,7 +142,17 @@ void EnhancedStringEncryptionPass::HandleUser(
 #define ENCRYPT_LOOP(T, get_key_fn)                                            \
   {                                                                            \
     std::vector<T> keys, encry, dummy, keys2, keys3;                           \
-    for (unsigned i = 0; i < CDS->getNumElements(); i++) {                     \
+    if (useRollingKey) {                                                       \
+      uint64_t key = rollingSeed;                                              \
+      for (unsigned i = 0; i < CDS->getNumElements(); i++) {                   \
+        key = nextRollingKey(key, rollingMul, rollingInc,                      \
+                             intType->getBitWidth());                          \
+        const T K1 = static_cast<T>(key);                                      \
+        const uint64_t V = CDS->getElementAsInteger(i);                       \
+        dummy.emplace_back(static_cast<T>(cryptoutils->get_key_fn()));         \
+        encry.emplace_back(static_cast<T>(V ^ K1));                            \
+      }                                                                        \
+    } else for (unsigned i = 0; i < CDS->getNumElements(); i++) {              \
       if (cryptoutils->get_range(100) >= ElementEncryptProbTemp) {             \
         unencryptedindex[GV].emplace_back(i);                                  \
         keys.emplace_back(1);                                                  \
@@ -175,8 +199,9 @@ void EnhancedStringEncryptionPass::HandleUser(
         break;                                                                 \
       }                                                                        \
     }                                                                          \
-    KeyConst =                                                                 \
-        ConstantDataArray::get(M->getContext(), ArrayRef<T>(keys));             \
+    if (!useRollingKey)                                                        \
+      KeyConst =                                                               \
+          ConstantDataArray::get(M->getContext(), ArrayRef<T>(keys));           \
     EncryptedConst =                                                           \
         ConstantDataArray::get(M->getContext(), ArrayRef<T>(encry));            \
     DummyConst =                                                               \
@@ -258,7 +283,6 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
 
   for (GlobalVariable *ugv : unhandleablegvs)
     if (std::find(genedgv.begin(), genedgv.end(), ugv) != genedgv.end()) {
-      auto mgv2keysval = mgv2keys[ugv];
       if (ugv->getInitializer()->getType() ==
           StructType::getTypeByName(M->getContext(),
                                     "struct.__NSConstantString_tag")) {
@@ -266,13 +290,13 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
             cast<GlobalVariable>(cast<ConstantStruct>(ugv->getInitializer())
                                      ->getOperand(2)
                                      ->stripPointerCasts());
-        mgv2keysval = mgv2keys[rawgv];
-        if (mgv2keysval.first && mgv2keysval.second)
-          GV2Info[rawgv] = {mgv2keysval.first, mgv2keysval.second,
-                            nullptr, nullptr, StrEncPattern::XOR_ONLY};
-      } else if (mgv2keysval.first && mgv2keysval.second) {
-        GV2Info[ugv] = {mgv2keysval.first, mgv2keysval.second,
-                        nullptr, nullptr, StrEncPattern::XOR_ONLY};
+        auto it = mgv2info.find(rawgv);
+        if (it != mgv2info.end())
+          GV2Info[rawgv] = it->second;
+      } else {
+        auto it = mgv2info.find(ugv);
+        if (it != mgv2info.end())
+          GV2Info[ugv] = it->second;
       }
     }
 
@@ -301,6 +325,15 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
 
     StrEncPattern pattern = static_cast<StrEncPattern>(
         cryptoutils->get_range(static_cast<uint32_t>(StrEncPattern::COUNT)));
+    bool useRollingKey = ElementEncryptProbTemp == 100 &&
+                         cryptoutils->get_range(100) < 50;
+    uint64_t rollingSeed = 0, rollingMul = 0, rollingInc = 0;
+    if (useRollingKey) {
+      pattern = StrEncPattern::XOR_ONLY;
+      rollingSeed = cryptoutils->get_uint64_t();
+      rollingMul = cryptoutils->get_uint64_t() | 1;
+      rollingInc = cryptoutils->get_uint64_t() | 1;
+    }
 
     if (intType == Type::getInt8Ty(M->getContext())) {
       ENCRYPT_LOOP(uint8_t, get_uint8_t)
@@ -314,7 +347,7 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
       llvm_unreachable("Unsupported CDS Type");
     }
 
-    std::string EncryptedName = createRandomGlobalName(*M, ".gv_");
+    std::string EncryptedName = createObfuscatedName(*M);
     GlobalVariable *EncryptedRawGV = new GlobalVariable(
         *M, EncryptedConst->getType(), false, GV->getLinkage(),
         EncryptedConst, EncryptedName, nullptr, GV->getThreadLocalMode(),
@@ -322,7 +355,7 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
     genedgv.emplace_back(EncryptedRawGV);
 
     GlobalVariable *DecryptSpaceGV;
-    std::string DecryptName = createRandomGlobalName(*M, ".gv_");
+    std::string DecryptName = createObfuscatedName(*M);
     if (rust_string) {
       ConstantAggregate *CA = cast<ConstantAggregate>(GV->getInitializer());
       CA->setOperand(0, DummyConst);
@@ -339,10 +372,21 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
     genedgv.emplace_back(DecryptSpaceGV);
 
     old2new[GV] = std::make_pair(EncryptedRawGV, DecryptSpaceGV);
-    GV2Info[DecryptSpaceGV] = {KeyConst, EncryptedRawGV,
-                               Key2Const, Key3Const, pattern};
+    StrEncInfo Info;
+    Info.KeyConst = KeyConst;
+    Info.EncryptedGV = EncryptedRawGV;
+    Info.Key2Const = Key2Const;
+    Info.Key3Const = Key3Const;
+    Info.Pattern = pattern;
+    Info.RollingKey = useRollingKey;
+    Info.RollingSeed = rollingSeed;
+    Info.RollingMul = rollingMul;
+    Info.RollingInc = rollingInc;
+    GV2Info[DecryptSpaceGV] = Info;
     mgv2keys[DecryptSpaceGV] = std::make_pair(KeyConst, EncryptedRawGV);
-    unencryptedindex[KeyConst] = unencryptedindex[GV];
+    mgv2info[DecryptSpaceGV] = Info;
+    if (KeyConst)
+      unencryptedindex[KeyConst] = unencryptedindex[GV];
     globalProcessedGVs.insert(GV);
   }
 
@@ -468,7 +512,7 @@ void EnhancedStringEncryptionPass::HandleFunction(Function *Func) {
   BranchInst::Create(B, C, condition, A);
 
   // 改动四c/d：在函数出口插入清零逻辑
-  if (StrEncCleanup)
+  if (StrEncCleanupTemp)
     InsertCleanupAtReturns(Func, StatusGV, GV2Info);
 }
 
@@ -552,7 +596,8 @@ void EnhancedStringEncryptionPass::HandleDecryptionBlock(
         rust_string ? cast<ConstantAggregate>(DecryptGV->getInitializer())
                     : nullptr;
 
-    ConstantDataArray *CastedCDA = cast<ConstantDataArray>(info.KeyConst);
+    ConstantDataArray *CastedCDA =
+        info.KeyConst ? cast<ConstantDataArray>(info.KeyConst) : nullptr;
     ConstantDataArray *CastedCDA2 =
         info.Key2Const ? cast<ConstantDataArray>(info.Key2Const) : nullptr;
     ConstantDataArray *CastedCDA3 =
@@ -561,8 +606,26 @@ void EnhancedStringEncryptionPass::HandleDecryptionBlock(
     appendToCompilerUsed(*info.EncryptedGV->getParent(), {info.EncryptedGV});
 
     uint64_t realkeyoff = 0;
-    for (uint64_t i = 0; i < CastedCDA->getType()->getNumElements(); i++) {
-      if (unencryptedindex[info.KeyConst].size() &&
+    uint64_t numElements =
+        info.RollingKey
+            ? cast<ArrayType>(info.EncryptedGV->getValueType())->getNumElements()
+            : CastedCDA->getType()->getNumElements();
+    Value *RollingKey = nullptr;
+    IntegerType *ElemTy = nullptr;
+    if (info.RollingKey) {
+      ElemTy = cast<IntegerType>(
+          cast<ArrayType>(info.EncryptedGV->getValueType())->getElementType());
+      RollingKey = emitSplitKey(IRB, info.RollingSeed, ElemTy);
+    }
+    Value *RollingMul = nullptr;
+    Value *RollingInc = nullptr;
+    if (info.RollingKey) {
+      RollingMul = emitSplitKey(IRB, info.RollingMul, ElemTy);
+      RollingInc = emitSplitKey(IRB, info.RollingInc, ElemTy);
+    }
+
+    for (uint64_t i = 0; i < numElements; i++) {
+      if (!info.RollingKey && unencryptedindex[info.KeyConst].size() &&
           std::find(unencryptedindex[info.KeyConst].begin(),
                     unencryptedindex[info.KeyConst].end(),
                     i) != unencryptedindex[info.KeyConst].end())
@@ -589,17 +652,22 @@ void EnhancedStringEncryptionPass::HandleDecryptionBlock(
               : IRB.CreateGEP(DecryptGV->getValueType(), DecryptGV,
                               {zero, offset2});
 
-      // 改动一：指令名随机化
-      LoadInst *LI = IRB.CreateLoad(CastedCDA->getElementType(), EncryptedGEP,
-                                    ""); // 原为 "EncryptedChar"
+	      // 改动一：指令名随机化
+      Type *LoadTy = info.RollingKey ? ElemTy : CastedCDA->getElementType();
+      LoadInst *LI = IRB.CreateLoad(LoadTy, EncryptedGEP,
+	                                    ""); // 原为 "EncryptedChar"
 
-      // 改动三：按模式生成逆运算
+	      // 改动三：按模式生成逆运算
       Value *Result = LI;
+      if (info.RollingKey)
+        RollingKey = emitNextRollingKey(IRB, RollingKey, RollingMul,
+                                        RollingInc, ElemTy);
       switch (info.Pattern) {
       case StrEncPattern::XOR_ONLY: {
         // load → xor(K1) → store
         BinaryOperator *XORInst = BinaryOperator::Create(
-            Instruction::Xor, Result, CastedCDA->getElementAsConstant(i));
+            Instruction::Xor, Result,
+            info.RollingKey ? RollingKey : CastedCDA->getElementAsConstant(i));
         IRB.Insert(XORInst);
         // 改动二：SubstituteXor
         if (cryptoutils->get_range(100) < StrEncSubXorProbTemp)
@@ -692,8 +760,11 @@ static SmallPtrSet<GlobalVariable *, 4> traceToDecryptGVs(
     // 剥离 bitcast / addrspacecast / GEP 常量表达式
     Cur = Cur->stripPointerCasts();
     if (auto *GV = dyn_cast<GlobalVariable>(Cur)) {
-      if (GV2Info.count(GV))
+      if (GV2Info.count(GV)) {
         Result.insert(GV);
+      } else if (GV->hasInitializer()) {
+        Worklist.push_back(GV->getInitializer());
+      }
       continue;
     }
     if (auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
@@ -710,6 +781,7 @@ static SmallPtrSet<GlobalVariable *, 4> traceToDecryptGVs(
       // load from alloca — 追溯所有 store 到该 alloca 的值
       // load from global — 追溯所有 store 到该全局变量的值 + 初始化器
       Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+      Worklist.push_back(Ptr);
       if (isa<AllocaInst>(Ptr) || isa<GlobalVariable>(Ptr)) {
         for (User *U : Ptr->users()) {
           if (auto *Store = dyn_cast<StoreInst>(U)) {
@@ -726,6 +798,9 @@ static SmallPtrSet<GlobalVariable *, 4> traceToDecryptGVs(
     } else if (auto *CE = dyn_cast<ConstantExpr>(Cur)) {
       for (unsigned i = 0; i < CE->getNumOperands(); ++i)
         Worklist.push_back(CE->getOperand(i));
+    } else if (auto *CA = dyn_cast<ConstantAggregate>(Cur)) {
+      for (unsigned i = 0; i < CA->getNumOperands(); ++i)
+        Worklist.push_back(CA->getOperand(i));
     }
   }
   return Result;
@@ -827,6 +902,9 @@ EnhancedStringEncryptionPass::run(Module &M, ModuleAnalysisManager &MAM) {
                                    &StrEncSubXorProbTemp))
         StrEncSubXorProbTemp = StrEncSubXorProb;
 
+      StrEncCleanupTemp = StrEncCleanup;
+      toObfuscateBoolOption(&F, "enstrcry_cleanup", &StrEncCleanupTemp);
+
       if (!((ElementEncryptProbTemp > 0) && (ElementEncryptProbTemp <= 100))) {
         errs() << "EnhancedStringEncryption element percentage "
                   "-enstrcry_prob=x must be 0 < x <= 100";
@@ -835,7 +913,7 @@ EnhancedStringEncryptionPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
       Constant *S =
           ConstantInt::getNullValue(Type::getInt32Ty(M.getContext()));
-      std::string StatusName = createRandomGlobalName(M, ".gv_");
+      std::string StatusName = createObfuscatedName(M);
       GlobalVariable *GV = new GlobalVariable(
           M, S->getType(), false, GlobalValue::LinkageTypes::PrivateLinkage,
           S, StatusName);

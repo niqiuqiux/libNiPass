@@ -23,11 +23,15 @@ enum class StrEncPattern : uint8_t {
 
 // 每个字符串的加密信息
 struct StrEncInfo {
-  Constant *KeyConst;          // 主 XOR 密钥数组
-  GlobalVariable *EncryptedGV; // 密文 GV
-  Constant *Key2Const;         // 第二密钥数组（SUB/ADD 用）
-  Constant *Key3Const;         // 第三密钥数组（XOR_ADD_XOR 用）
-  StrEncPattern Pattern;       // 加密模式
+  Constant *KeyConst = nullptr;          // 主 XOR 密钥数组
+  GlobalVariable *EncryptedGV = nullptr; // 密文 GV
+  Constant *Key2Const = nullptr;         // 第二密钥数组（SUB/ADD 用）
+  Constant *Key3Const = nullptr;         // 第三密钥数组（XOR_ADD_XOR 用）
+  StrEncPattern Pattern = StrEncPattern::XOR_ONLY;
+  bool RollingKey = false;
+  uint64_t RollingSeed = 0;
+  uint64_t RollingMul = 0;
+  uint64_t RollingInc = 0;
 };
 
 /**
@@ -53,6 +57,7 @@ public:
   // 解密空间对应的密钥和加密后的全局变量（仅用于跨函数 unhandleablegvs 查找）
   std::unordered_map<GlobalVariable *, std::pair<Constant *, GlobalVariable *>>
       mgv2keys;
+  std::unordered_map<GlobalVariable *, StrEncInfo> mgv2info;
 
   // 每个常量中未加密的元素索引
   std::unordered_map<Constant *, SmallVector<unsigned int, 16>>

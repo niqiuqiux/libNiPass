@@ -161,7 +161,7 @@ void FlatteningEnhanced::DoFlatteningEnhanced(Function *f) {
     iter--;
     if (oldEntry->size() > 1)
         iter--;
-    BasicBlock *splited = oldEntry->splitBasicBlock(iter, Twine("FirstBB"));
+    BasicBlock *splited = oldEntry->splitBasicBlock(iter, Twine(""));
     firstbb = splited;
     origBB.insert(origBB.begin(), splited);
 
@@ -251,11 +251,11 @@ void FlatteningEnhanced::DoFlatteningEnhanced(Function *f) {
     // ============================================================
     BasicBlock *newEntry = oldEntry;
     BasicBlock *loopBegin =
-        BasicBlock::Create(f->getContext(), "LoopBegin", f, newEntry);
+        BasicBlock::Create(f->getContext(), "", f, newEntry);
     BasicBlock *defaultCase =
-        BasicBlock::Create(f->getContext(), "DefaultCase", f, newEntry);
+        BasicBlock::Create(f->getContext(), "", f, newEntry);
     BasicBlock *loopEnd =
-        BasicBlock::Create(f->getContext(), "LoopEnd", f, newEntry);
+        BasicBlock::Create(f->getContext(), "", f, newEntry);
 
     newEntry->moveBefore(loopBegin);
 
@@ -265,11 +265,11 @@ void FlatteningEnhanced::DoFlatteningEnhanced(Function *f) {
     BranchInst::Create(loopBegin, newEntry);
 
     AllocaInst *switchVar =
-        new AllocaInst(Type::getInt32Ty(f->getContext()), 0, Twine("switchVar"),
+        new AllocaInst(Type::getInt32Ty(f->getContext()), 0, Twine(""),
                        newEntry->getTerminator());
 
     LoadInst *swValue =
-        new LoadInst(Type::getInt32Ty(f->getContext()), switchVar, "cmd", loopBegin);
+        new LoadInst(Type::getInt32Ty(f->getContext()), switchVar, "", loopBegin);
 
     SwitchInst *sw = SwitchInst::Create(swValue, defaultCase, 0, loopBegin);
 
@@ -311,7 +311,7 @@ void FlatteningEnhanced::DoFlatteningEnhanced(Function *f) {
         rand_list.push_back(bogusNum);
 
         BasicBlock *bogusBB =
-            BasicBlock::Create(f->getContext(), "bogusCase", f, loopEnd);
+            BasicBlock::Create(f->getContext(), "", f, loopEnd);
         IRBuilder<> bogusIrb(bogusBB);
 
         // 生成看起来真实的计算：load keyArray → xor → store switchVar
@@ -391,7 +391,7 @@ void FlatteningEnhanced::DoFlatteningEnhanced(Function *f) {
                 oldBr->getCondition(),
                 ConstantInt::get(sw->getCondition()->getType(), fixNumTrue),
                 ConstantInt::get(sw->getCondition()->getType(), fixNumFalse),
-                Twine("choice"), block->getTerminator());
+                Twine(""), block->getTerminator());
 
             block->getTerminator()->eraseFromParent();
 
